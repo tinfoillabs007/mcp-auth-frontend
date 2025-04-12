@@ -26,6 +26,7 @@ import {
 	OAUTH_CLIENT_ID, // Client ID for this Next.js app
 	OAUTH_REDIRECT_URI // Redirect URI used in the initial auth request
 } from '@/lib/constants';
+import { supabaseAdmin } from '@/utils/supabase-admin'; // Import your admin client
 
 // Define expected request body structure
 interface TokenRequestBody {
@@ -105,26 +106,86 @@ export async function POST(request: NextRequest) {
         // Log raw response for debugging
         const responseText = await tokenResponse.text();
         console.log(`Auth Worker token response status: ${tokenResponse.status}`);
-        console.log(`Auth Worker token response body: ${responseText}`);
+        // console.log(`Auth Worker token response body: ${responseText}`); // Maybe hide tokens in prod logs
 
         let responseData: AuthWorkerTokenResponse | AuthWorkerErrorResponse;
         try {
             responseData = JSON.parse(responseText);
         } catch (e) {
              console.error("Failed to parse JSON response from auth-worker token endpoint.");
-             return NextResponse.json({ error: 'server_error', error_description: 'Invalid response from authorization server.' }, { status: 502 }); // Bad Gateway
+             return NextResponse.json({ error: 'server_error', error_description: 'Invalid response from authorization server.' }, { status: 502 });
         }
 
 
-		if (!tokenResponse.ok) {
+		if (!tokenResponse.ok || 'error' in responseData) {
             // Forward the error from the auth server
             console.error('Auth Worker token endpoint returned error:', responseData);
-			return NextResponse.json(responseData, { status: tokenResponse.status }); // Use status from auth worker response
+            const errorResponse = responseData as AuthWorkerErrorResponse;
+			return NextResponse.json(errorResponse, { status: tokenResponse.status }); // Use status from auth worker response
 		}
 
         // Token exchange successful, forward the token data
-        console.log('Token exchange successful. Forwarding token data to client.');
-		return NextResponse.json(responseData as AuthWorkerTokenResponse, { status: 200 });
+        console.log('Token exchange successful.');
+
+        // --- REMOVE User Info Fetch Block ---
+        /*
+        const userInfoUrl = `${AUTH_WORKER_URL}/api/me`; 
+        let userEmail: string | undefined;
+        let userName: string | undefined; 
+        try {
+             console.log(`Fetching user info from: ${userInfoUrl}`);
+             const userInfoResponse = await fetch(userInfoUrl, {
+                 headers: {
+                     'Authorization': `Bearer ${tokenData.access_token}` 
+                 }
+             });
+             // ... rest of fetch and error handling ...
+             userEmail = userInfo.email; 
+             userName = userInfo.name;
+        } catch (userInfoError: any) {
+            // ... error handling ...
+             return NextResponse.json({ error: 'userinfo_error', ... }, { status: 502 });
+        }
+        */
+       // We will attempt find/create without email initially, relying on client to provide later if needed
+       let userEmail: string | undefined = undefined; // No email fetched here
+       let userName: string | undefined = undefined; // No name fetched here
+
+        // --- REMOVE Find or Create Supabase User Block ---
+        /* 
+        let supabaseUserId: string | undefined;
+        let userAlreadyExisted = false;
+        try {
+            if (!userEmail) { 
+                throw new Error("Cannot find or create Supabase user without an email address.");
+            }
+            // ... rest of try block ...
+        } catch (supabaseError: any) {
+             // ... catch block ...
+             return NextResponse.json({ error: 'supabase_user_error', ... }, { status: 500 });
+        }
+        if (userAlreadyExisted) {
+             try {
+                 // ... find block ...
+            } catch(findError: any) {
+                 // ... catch block ...
+                 return NextResponse.json({ error: 'supabase_user_find_error', ... }, { status: 500 });
+            }
+        }
+        if (!supabaseUserId) {
+            // ... error check ...
+             return NextResponse.json({ error: 'linking_error', ... }, { status: 500 });
+        }
+        */
+
+        // --- Return ONLY Tokens to Client --- 
+        // The linking happens in a separate step initiated by the client
+        const tokenData = responseData as AuthWorkerTokenResponse;
+        // The payload no longer includes supabase_user_id from this route
+        const responsePayload = { ...tokenData }; 
+
+        console.log('[Token Route] Returning tokens to client.');
+        return NextResponse.json(responsePayload, { status: 200 });
 
 	} catch (error: any) {
 		console.error('Network or fetch error during token exchange:', error);

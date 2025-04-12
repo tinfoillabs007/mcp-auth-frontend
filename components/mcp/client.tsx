@@ -29,8 +29,8 @@
 
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { useSearchParams } from 'next/navigation';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { toast } from "sonner"; // Import toast from sonner
 // Import only fetchMcpApi and type definitions from client lib
 import { fetchMcpApi, TokenResponse, TokenErrorResponse } from '@/lib/mcp/client';
@@ -40,16 +40,108 @@ import { STORAGE_KEY_PKCE_VERIFIER, STORAGE_KEY_OAUTH_STATE } from '@/lib/consta
 // Import the Auth Button to render when idle
 import MCPAuthButton from '@/lib/mcp/auth-button';
 import { useAuth } from '@/context/auth-context'; // Import useAuth
+// Import Hanko SDK
+import { Hanko } from "@teamhanko/hanko-elements";
+// Read env var directly
+const hankoApiUrl = process.env.NEXT_PUBLIC_HANKO_API_URL; 
 
 // Assume a simple CodeBlock component exists for display
 const CodeBlock = ({ data }: { data: any }) => <pre className="p-4 bg-gray-100 dark:bg-gray-900 rounded-md text-xs overflow-x-auto"><code>{JSON.stringify(data, null, 2)}</code></pre>;
 
 export function MCPClient() {
   const searchParams = useSearchParams();
-  const { authState, setAuthState } = useAuth(); // Use context state
+  const router = useRouter(); // <-- Get router instance
+  const { authState, login, logout, setAuthState } = useAuth(); // Use context state AND the login/logout functions
   const [apiResponse, setApiResponse] = useState<any>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [isApiLoading, setIsApiLoading] = useState(false);
+
+  // Use useRef for Hanko instance to avoid re-triggering effect on setHanko
+  const hankoRef = useRef<Hanko | null>(null); 
+  const exchangeAttemptedRef = useRef(false);
+
+  // Initialize Hanko SDK ONCE on mount and store in ref
+  useEffect(() => {
+    if (hankoApiUrl && !hankoRef.current) { // Initialize only if URL exists and ref is null
+        console.log("Initializing Hanko SDK instance...");
+        try {
+            hankoRef.current = new Hanko(hankoApiUrl);
+            console.log("Hanko SDK instance created.");
+        } catch (sdkError) {
+             console.error("Failed to initialize Hanko SDK:", sdkError);
+             // Handle error appropriately (e.g., show error to user)
+        }
+    } else if (!hankoApiUrl) {
+        console.error("NEXT_PUBLIC_HANKO_API_URL is not configured.");
+    }
+  }, []); // Empty dependency array - runs only once on mount
+
+  // Function to handle linking after login (now uses hankoRef)
+  const linkHankoToSupabase = useCallback(async (currentAuthState: typeof authState): Promise<string | null> => {
+    const hanko = hankoRef.current; // Get instance from ref
+    
+    // Check ref for Hanko instance
+    if (!hanko || currentAuthState.status !== 'authenticated' || !currentAuthState.accessToken) {
+        console.warn(`linkHankoToSupabase: Preconditions not met (Hanko SDK Ready: ${!!hanko}, Status: ${currentAuthState.status}, Token: ${!!currentAuthState.accessToken})`);
+        return null;
+    }
+
+    console.log("linkHankoToSupabase: Attempting to fetch Hanko user details...");
+    try {
+        const hankoUser = await hanko.user.getCurrent();
+        console.log("Hanko user details fetched client-side:", hankoUser);
+
+        if (hankoUser && hankoUser.id && hankoUser.email) {
+            // Now we have Hanko ID, Email, and the authState (which might have supabaseUserId undefined)
+            // Call the linking API route
+            console.log(`Calling linking API with Hanko User ${hankoUser.id}, Email ${hankoUser.email}, Current Supabase User ${currentAuthState.supabaseUserId}`);
+            try {
+                const linkResponse = await fetch('/api/auth/link-supabase', {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${currentAuthState.accessToken}` 
+                    },
+                    body: JSON.stringify({
+                        hankoUserId: hankoUser.id,
+                        hankoEmail: hankoUser.email,
+                        currentSupabaseUserId: currentAuthState.supabaseUserId 
+                    })
+                });
+                const linkData = await linkResponse.json();
+
+                if (!linkResponse.ok) {
+                    throw new Error(linkData.message || `Linking failed: ${linkResponse.status}`);
+                }
+
+                console.log("Supabase user linking successful/confirmed:", linkData);
+                const confirmedUserId = linkData.supabaseUserId; // Get ID from response
+
+                if (confirmedUserId && confirmedUserId !== currentAuthState.supabaseUserId) {
+                    console.log("Updating auth context with confirmed Supabase User ID.");
+                    // Update the existing auth state with the confirmed ID
+                    setAuthState(prev => ({ ...prev, supabaseUserId: confirmedUserId }));
+                } else if (!confirmedUserId) {
+                     console.warn("Linking API did not return a Supabase User ID.");
+                }
+
+                // Return the confirmed/fetched ID (or null if missing)
+                return confirmedUserId || null; 
+
+            } catch (linkError: any) {
+                console.error("Failed to link Hanko user to Supabase user:", linkError);
+                toast.error("Account Linking Error", { description: linkError.message });
+            }
+        } else {
+             console.error("Could not get valid Hanko user details client-side.");
+        }
+    } catch (err) {
+        console.error("Failed to fetch Hanko user details client-side:", err);
+        // Handle error fetching Hanko details if needed
+    }
+    
+    return null; // Return null if any error occurred
+  }, [setAuthState]); // Removed hanko state from deps, using ref now
 
   // Effect to handle the OAuth callback
   useEffect(() => {
@@ -58,164 +150,125 @@ export function MCPClient() {
     const error = searchParams.get('error');
     const errorDescription = searchParams.get('error_description');
 
-    // Check for errors returned from the authorization server
+    // --- Handle redirect errors ---
     if (error) {
-        console.error(`OAuth Error received: ${error} - ${errorDescription}`);
-        const errorMsg = `Authorization failed: ${error} (${errorDescription || 'No description provided'})`;
-        setAuthState({
-            status: 'error',
-            error: errorMsg,
-            accessToken: null, refreshToken: null, expiresAt: null, scope: null,
-        });
-        toast.error("OAuth Error", { description: errorMsg }); // Add toast
-        // Clear stored state if an error occurred related to the flow
-        sessionStorage.removeItem(STORAGE_KEY_PKCE_VERIFIER); // Use constant
-        sessionStorage.removeItem(STORAGE_KEY_OAUTH_STATE);   // Use constant
-         // Clear URL params to avoid reprocessing on refresh
+        if (!exchangeAttemptedRef.current) { // Process error only once
+            console.error(`OAuth Error received: ${error} - ${errorDescription}`);
+            const errorMsg = `Authorization failed: ${error} (${errorDescription || 'No description provided'})`;
+            logout(); // Clear auth state
+            toast.error("OAuth Error", { description: errorMsg });
+            // Clear storage just in case
+            sessionStorage.removeItem(STORAGE_KEY_PKCE_VERIFIER);
+            sessionStorage.removeItem(STORAGE_KEY_OAUTH_STATE);
+            // Clear URL params
+            if (typeof window !== 'undefined') {
+                window.history.replaceState({}, '', window.location.pathname);
+            }
+            exchangeAttemptedRef.current = true; // Mark error as processed
+        }
+        return;
+    }
+
+    // --- Handle successful redirect ---
+    // Only proceed if code/state exist, auth is idle, AND exchange not yet attempted
+    if (code && state && authState.status === 'idle' && !exchangeAttemptedRef.current && hankoRef.current) {
+        
+        // Mark attempt *before* async operations
+        exchangeAttemptedRef.current = true; 
+        console.log('OAuth callback detected. Hanko SDK ready. Starting process...');
+
+        // Use an async IIFE to handle the entire flow
+        (async () => {
+            try {
+                // Retrieve and validate state/verifier
+                const storedVerifier = sessionStorage.getItem(STORAGE_KEY_PKCE_VERIFIER);
+                const storedState = sessionStorage.getItem(STORAGE_KEY_OAUTH_STATE);
+                sessionStorage.removeItem(STORAGE_KEY_PKCE_VERIFIER);
+                sessionStorage.removeItem(STORAGE_KEY_OAUTH_STATE);
+                console.log(`[MCPClient] Read/Cleared sessionStorage.`);
+
+                if (!storedState || storedState !== state) { throw new Error('State mismatch.'); }
+                console.log('OAuth state parameter validated.');
+                if (!storedVerifier) { throw new Error('PKCE verifier missing.'); }
+                console.log('PKCE verifier retrieved.');
+
+                // Set loading state
+                setAuthState(prev => ({ ...prev, status: 'loading', error: null }));
+
+                // --- Exchange Token ---
+                console.log('Calling /api/auth/token...');
+                const tokenRes = await fetch('/api/auth/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code: code, codeVerifier: storedVerifier }),
+                });
+                const tokenData = await tokenRes.json();
+                if (!tokenRes.ok) {
+                    throw new Error(tokenData.error_description || tokenData.error || `Token exchange failed: ${tokenRes.status}`);
+                }
+                console.log('Token exchange successful:', tokenData);
+                
+                // --- Store initial token data (might lack supabaseUserId) ---
+                login(tokenData); 
+                console.log(`Tokens stored. Initial Supabase User ID: ${tokenData.supabase_user_id}`);
+                
+                // --- Link Hanko and get final state (with definite supabaseUserId) ---
+                const initialAuthState = { 
+                    ...authState, // Spread previous state for safety
+                    status: 'authenticated', 
+                    accessToken: tokenData.access_token, 
+                    refreshToken: tokenData.refresh_token || null,
+                    expiresAt: Date.now() + (tokenData.expires_in || 3600) * 1000,
+                    scope: tokenData.scope || null,
+                    supabaseUserId: tokenData.supabase_user_id || null
+                } as typeof authState; // Assert type
+                const finalSupabaseUserId = await linkHankoToSupabase(initialAuthState);
+                console.log(`Linking process completed. Final Supabase User ID: ${finalSupabaseUserId}`);
+                
+                // --- Success ---
+                toast.success("Authentication Successful", { description: "Session initialized."});
+                
+                // Clear URL AFTER everything is done
+                if (typeof window !== 'undefined') {
+                    window.history.replaceState({}, '', window.location.pathname);
+                    console.log('[MCPClient] Cleared auth code/state from URL.');
+                }
+                
+                // Redirect AFTER linking and state update
+                console.log("Redirecting to dashboard...");
+                router.replace("/dashboard"); // Or appropriate page
+
+            } catch (err: any) {
+                // Handle ANY error in the flow
+                console.error('Error during OAuth callback processing:', err);
+                logout(); // Reset state
+                toast.error("Authentication Failed", { description: err.message });
+                exchangeAttemptedRef.current = false; // Allow retry on error
+            }
+        })(); // Immediately invoke the async function
+
+    } else if (authState.status === 'idle' && !code && !error) {
+        // Normal page load without callback params
+        if (exchangeAttemptedRef.current) {
+            // Reset ref if we land here after a previous attempt (e.g., error occurred, user navigated away/back)
+            exchangeAttemptedRef.current = false; 
+        }
+        console.log('Client page loaded, no OAuth callback detected.');
+    } else if (code && state && authState.status === 'authenticated') {
+         // Callback params still present, but already authenticated. Clear URL.
+         console.log("Already authenticated, clearing stale callback params from URL.");
          if (typeof window !== 'undefined') {
             window.history.replaceState({}, '', window.location.pathname);
          }
-        return;
+    } else if (code && state && authState.status === 'idle' && !exchangeAttemptedRef.current && !hankoRef.current) {
+        // Condition added: Callback detected but Hanko SDK isn't ready yet
+        console.warn("OAuth callback detected, but Hanko SDK not yet initialized. Waiting...");
+        // Optional: Set a loading state specific to SDK initialization?
     }
 
-
-    // Only proceed if we have a code and state, and are currently idle (to prevent loops)
-    if (code && state && authState.status === 'idle') {
-      console.log('OAuth callback detected. Code:', code, 'State:', state);
-      setAuthState(prev => ({ ...prev, status: 'loading', error: null }));
-
-      // Retrieve stored values
-      const storedVerifier = sessionStorage.getItem(STORAGE_KEY_PKCE_VERIFIER);
-      const storedState = sessionStorage.getItem(STORAGE_KEY_OAUTH_STATE);
-      
-      // Log retrieved values and state from URL
-      console.log(`[MCPClient] State from URL: ${state}`);
-      console.log(`[MCPClient] Stored state from sessionStorage (key: ${STORAGE_KEY_OAUTH_STATE}):`, storedState);
-      console.log(`[MCPClient] Stored verifier from sessionStorage (key: ${STORAGE_KEY_PKCE_VERIFIER}):`, storedVerifier);
-
-      // Clean up sessionStorage immediately after retrieval
-      sessionStorage.removeItem(STORAGE_KEY_PKCE_VERIFIER);
-      sessionStorage.removeItem(STORAGE_KEY_OAUTH_STATE);
-      console.log(`[MCPClient] Cleared sessionStorage items for keys: ${STORAGE_KEY_PKCE_VERIFIER}, ${STORAGE_KEY_OAUTH_STATE}`);
-
-      // Validate state parameter for CSRF protection
-      if (!storedState || storedState !== state) {
-        console.error('OAuth state mismatch! Potential CSRF attack.');
-        const errorMsg = 'State mismatch. Authorization process aborted.';
-        setAuthState({
-          status: 'error',
-          error: errorMsg,
-          accessToken: null, refreshToken: null, expiresAt: null, scope: null,
-        });
-        toast.error("Security Alert", { description: errorMsg }); // Add toast
-          if (typeof window !== 'undefined') {
-            window.history.replaceState({}, '', window.location.pathname);
-          }
-        return;
-      }
-      console.log('OAuth state parameter validated successfully.');
-
-      if (!storedVerifier) {
-         console.error('OAuth PKCE verifier not found in session storage.');
-         const errorMsg = 'PKCE verifier missing. Authorization process aborted.';
-         setAuthState({
-           status: 'error',
-           error: errorMsg,
-           accessToken: null, refreshToken: null, expiresAt: null, scope: null,
-         });
-         toast.error("Authorization Error", { description: errorMsg }); // Add toast
-          if (typeof window !== 'undefined') {
-             window.history.replaceState({}, '', window.location.pathname);
-          }
-         return;
-      }
-       console.log('PKCE verifier retrieved successfully.');
-
-      // --- Initiate Server-Side Token Exchange ---
-      console.log('Calling backend API route (/api/auth/token) to exchange code...');
-      fetch('/api/auth/token', { // Call own backend route
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-              code: code,
-              codeVerifier: storedVerifier,
-          }),
-      })
-      .then(async (res) => {
-          // Try to parse JSON regardless of status code
-          let responseData;
-          try {
-               responseData = await res.json();
-          } catch (parseError) {
-                console.error("Failed to parse JSON response from /api/auth/token:", parseError);
-                // Throw a new error or handle appropriately
-                 throw new Error(`Received non-JSON response (${res.status}) from token exchange endpoint.`);
-          }
-
-          if (!res.ok) {
-              // If response not OK, treat responseData as TokenErrorResponse
-              console.error('Token exchange API route error:', responseData);
-              // Throw an error to be caught by the .catch block below
-              const errorPayload = responseData as TokenErrorResponse;
-              throw new Error(errorPayload.error_description || errorPayload.error || `Token exchange failed with status ${res.status}`);
-          }
-          // If response OK, treat responseData as TokenResponse
-          console.log('Token exchange via API route successful:', responseData);
-          toast.success("Authentication Successful", { description: "Tokens obtained.", duration: 2000 }); // Add toast
-          return responseData as TokenResponse; // Assume backend returns compatible structure
-      })
-      .then(tokenData => {
-            // Handle token exchange success (response from backend API route)
-            const expiresIn = tokenData.expires_in;
-            // Ensure expires_in is a valid number before calculation
-            const expiresAtMs = typeof expiresIn === 'number' && expiresIn > 0 
-                                ? Date.now() + expiresIn * 1000 
-                                : null;
-            console.log(`Tokens obtained via backend. Access token expires in ${expiresIn} seconds (at ${expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'N/A'}).`);
-            setAuthState({
-              status: 'authenticated',
-              accessToken: tokenData.access_token,
-              refreshToken: tokenData.refresh_token || null,
-              expiresAt: expiresAtMs,
-              scope: tokenData.scope,
-              error: null,
-            });
-            // **Security Note:** Storing tokens in React state/sessionStorage is for demo ONLY.
-
-            // Clear URL parameters ONLY AFTER successful authentication state update
-            if (typeof window !== 'undefined') {
-                window.history.replaceState({}, '', window.location.pathname);
-                console.log('[MCPClient] Cleared auth code and state from URL after successful auth.');
-            }
-      })
-      .catch(err => {
-          // Handle errors from the fetch call itself (network) OR errors thrown from .then block
-          console.error('Error during backend token exchange fetch:', err);
-          const errorMsg = `Token exchange failed: ${err.message}`;
-           setAuthState({
-             status: 'error',
-             error: errorMsg,
-             accessToken: null, refreshToken: null, expiresAt: null, scope: null,
-           });
-           toast.error("Token Exchange Failed", { description: errorMsg }); // Add toast
-           // Optional: Clear URL params on error too
-           // if (typeof window !== 'undefined') {
-           //    window.history.replaceState({}, '', window.location.pathname);
-           // }
-      })
-      .finally(() => {
-           // --- REMOVED URL Clearing from here --- 
-           // Ensure loading state stops if needed, but URL clear is now conditional
-           console.log("[MCPClient] Token exchange fetch flow finished.");
-      });
-      // --- End Server-Side Token Exchange ---
-
-    } else if (authState.status === 'idle' && !code && !error) {
-        console.log('Client page loaded, no OAuth callback detected.');
-    }
-  }, [searchParams, authState.status, setAuthState]); // Add setAuthState to dependency array
+  // Only include dependencies that trigger re-evaluation when necessary
+  // Avoid including setAuthState directly if possible
+  }, [searchParams, authState.status, login, logout, setAuthState, router, linkHankoToSupabase]); 
 
   // Handler for making an example API call to the mcp-worker
   const handleApiCall = useCallback(async () => {
@@ -226,7 +279,8 @@ export function MCPClient() {
     }
     if (authState.expiresAt && Date.now() > authState.expiresAt) {
         setApiError('Access token expired. Please re-authenticate or refresh.');
-        setAuthState(prev => ({ ...prev, status: 'error', error: 'Access token expired.' }));
+        // Use logout to reset state on expiry
+        logout(); 
         toast.error("Token Expired", { description: "Your session has expired. Please log in again.", duration: 3000 }); // Add toast
         return;
     }
@@ -261,7 +315,7 @@ export function MCPClient() {
     } finally {
         setIsApiLoading(false);
     }
-  }, [authState.status, authState.accessToken, authState.expiresAt, setAuthState]); // Add setAuthState
+  }, [authState.status, authState.accessToken, authState.expiresAt, logout]); // Add logout to dependency array
 
   // --- Conditional Rendering --- 
   if (authState.status === 'idle') {

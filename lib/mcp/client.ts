@@ -36,6 +36,7 @@ export interface TokenResponse {
     expires_in: number; // Typically seconds
     refresh_token?: string;
     scope: string; // Space-separated list of granted scopes
+    supabase_user_id?: string;
     // We might add other fields returned by our backend API route
     expires_at?: number; // Expiry timestamp in ms (calculated client-side or returned by backend)
 }
