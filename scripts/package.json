@@ -1,0 +1,9 @@
+{
+  "name": "rag-test-scripts",
+  "version": "1.0.0",
+  "description": "Test scripts for RAG system",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.0"
+  }
+} 

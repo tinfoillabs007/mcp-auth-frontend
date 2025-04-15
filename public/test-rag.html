@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG System Test</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            line-height: 1.5;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        button {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 4px 2px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        pre {
+            background-color: #f7f7f7;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        .steps {
+            margin-top: 20px;
+        }
+        .log {
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 5px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>RAG System Test</h1>
+    
+    <div class="user-id">
+        <h2>User ID</h2>
+        <p>Your Supabase User ID: <span id="userId">Not found</span></p>
+    </div>
+
+    <div class="steps">
+        <h2>Test Steps</h2>
+        <button id="createSource">Step 1: Create Test Source</button>
+        <button id="ingestDocument" disabled>Step 2: Ingest Test Document</button>
+        <button id="testQuery" disabled>Step 3: Test Query</button>
+    </div>
+
+    <div class="log">
+        <h2>Log</h2>
+        <pre id="log"></pre>
+    </div>
+
+    <script>
+        // Get user ID from localStorage
+        let sourceId;
+        let userId;
+        
+        function log(message) {
+            const logElement = document.getElementById('log');
+            logElement.textContent += message + '\n';
+            logElement.scrollTop = logElement.scrollHeight;
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            try {
+                const authState = JSON.parse(localStorage.getItem('mcp_auth_state'));
+                if (authState && authState.supabaseUserId) {
+                    userId = authState.supabaseUserId;
+                    document.getElementById('userId').textContent = userId;
+                    log(`Found user ID: ${userId}`);
+                } else {
+                    log('User ID not found in localStorage. Please log in first.');
+                }
+            } catch (error) {
+                log(`Error reading localStorage: ${error.message}`);
+            }
+        });
+
+        // Step 1: Create source
+        document.getElementById('createSource').addEventListener('click', async () => {
+            if (!userId) {
+                log('Cannot proceed: User ID not found');
+                return;
+            }
+
+            try {
+                log('Creating test source...');
+                const response = await fetch('/api/rag/sources', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-User-ID': userId
+                    },
+                    body: JSON.stringify({
+                        sourceType: 'test',
+                        sourceIdentifier: 'test-document-' + Date.now(),
+                        metadata: {
+                            description: 'Test source for troubleshooting'
+                        }
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    log(`Failed to create source: ${JSON.stringify(data)}`);
+                    return;
+                }
+
+                sourceId = data.id;
+                log(`Source created successfully. ID: ${sourceId}`);
+                log(JSON.stringify(data, null, 2));
+                
+                // Enable next step
+                document.getElementById('ingestDocument').disabled = false;
+            } catch (error) {
+                log(`Error creating source: ${error.message}`);
+            }
+        });
+
+        // Step 2: Ingest document
+        document.getElementById('ingestDocument').addEventListener('click', async () => {
+            if (!userId || !sourceId) {
+                log('Cannot proceed: Missing user ID or source ID');
+                return;
+            }
+
+            try {
+                log('Ingesting test document...');
+                const response = await fetch('/api/rag/ingest', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-User-ID': userId
+                    },
+                    body: JSON.stringify({
+                        sourceId: sourceId,
+                        documentId: 'test-doc-' + Date.now(),
+                        content: 'This is a test document for the RAG system. It contains information about artificial intelligence and machine learning. The document discusses various AI techniques including transformers, neural networks, and natural language processing.',
+                        accountType: 'manual',
+                        metadata: {
+                            title: 'Test Document',
+                            author: 'RAG System Test'
+                        }
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    log(`Failed to ingest document: ${JSON.stringify(data)}`);
+                    return;
+                }
+
+                log('Document ingested successfully.');
+                log(JSON.stringify(data, null, 2));
+                
+                // Enable next step
+                document.getElementById('testQuery').disabled = false;
+            } catch (error) {
+                log(`Error ingesting document: ${error.message}`);
+            }
+        });
+
+        // Step 3: Test query
+        document.getElementById('testQuery').addEventListener('click', async () => {
+            if (!userId) {
+                log('Cannot proceed: User ID not found');
+                return;
+            }
+
+            try {
+                log('Testing query...');
+                const response = await fetch('/api/rag/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-User-ID': userId
+                    },
+                    body: JSON.stringify({
+                        queryText: 'get email from inbox',
+                        matchThreshold: 0.8,
+                        matchCount: 10,
+                        sourceTypes: ['gmail']
+                    })
+                });
+
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    log(`Failed to query: ${JSON.stringify(data)}`);
+                    return;
+                }
+
+                log('Query successful:');
+                log(JSON.stringify(data, null, 2));
+                log('\nTest completed successfully!');
+            } catch (error) {
+                log(`Error querying: ${error.message}`);
+            }
+        });
+    </script>
+</body>
+</html> 

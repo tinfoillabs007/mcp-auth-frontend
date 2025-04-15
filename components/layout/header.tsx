@@ -43,6 +43,22 @@ export function Header() {
             >
               RAG Mgmt
             </Link>
+            {/* Add Insights link */}
+            <Link
+              href="/insights"
+              className="transition-colors hover:text-foreground/80 text-foreground/60"
+            >
+              AI Insights
+            </Link>
+            {/* Add Debug link, only visible to authenticated users */}
+            {isAuthenticated && (
+              <Link
+                href="/debug"
+                className="transition-colors hover:text-foreground/80 text-foreground/60"
+              >
+                Debug
+              </Link>
+            )}
              {/* Add more links as needed */}
             {/* <Link href="/client" className="transition-colors hover:text-foreground/80 text-foreground/60">Client</Link> */}
           </nav>
